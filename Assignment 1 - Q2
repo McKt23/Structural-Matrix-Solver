@@ -1,0 +1,489 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# =====================================================================
+# 1. PHYSICAL CONSTANTS (Given in the assignment)
+# =====================================================================
+# E: Modulus of Elasticity for steel-like material in Pascals (N/m^2)
+# AREA: Cross-sectional area of the truss members in square meters (1 cm^2 = 1e-4 m^2)
+E = 200e9
+AREA = 1e-4
+
+
+# =====================================================================
+# 2. STRUCTURED VARIABLE DEFINITION (Requested in Q2 Requirements)
+# =====================================================================
+# The assignment requires a structured variable storing:
+# A: Matrix coefficients, r: Number of rows, m: Bandwidth size
+class BandedMatrix:
+    def __init__(self, A, m):
+        self.A = A  # Matrix coefficients (NumPy array)
+        self.r = A.shape[0]  # Number of rows (Total DOFs)
+        self.m = m  # Bandwidth size (m)
+
+
+# =====================================================================
+# 3. TRUSS GEOMETRY & CONNECTIVITY (Coordinates and Element Links)
+# =====================================================================
+def case1_nodes():
+    """Generates (x, y) coordinates for Case 1 (Single-story, 5 panels)."""
+    nodes = []
+    for i in range(6): nodes.append((4 * i, 0))  # Bottom chord nodes (y=0)
+    for i in range(6): nodes.append((4 * i, 4))  # Top chord nodes (y=4)
+    return np.array(nodes)
+
+
+def case2_nodes():
+    """Generates (x, y) coordinates for Case 2 (Two-story, 5 panels)."""
+    nodes = []
+    for i in range(6): nodes.append((4 * i, 0))  # Bottom chord (y=0)
+    for i in range(6): nodes.append((4 * i, 4))  # Middle chord (y=4)
+    for i in range(6): nodes.append((4 * i, 8))  # Top chord (y=8)
+    return np.array(nodes)
+
+
+def case1_elements():
+    """Defines which nodes are connected by elements (bars) for Case 1."""
+    elems = []
+    for i in range(5): elems.append((i, i + 1))  # Bottom horizontal bars
+    for i in range(6, 11): elems.append((i, i + 1))  # Top horizontal bars
+    for i in range(6): elems.append((i, i + 6))  # Vertical bars
+    for i in range(5):
+        elems.append((i, i + 7))  # Diagonal bars (/)
+        elems.append((i + 1, i + 6))  # Diagonal bars (\)
+    return elems
+
+
+def case2_elements():
+    """Defines which nodes are connected by elements (bars) for Case 2."""
+    elems = []
+    for r in [0, 6, 12]:  # Horizontal bars for all 3 levels
+        for i in range(5): elems.append((r + i, r + i + 1))
+    for i in range(6):  # Vertical bars for both stories
+        elems.append((i, i + 6))
+        elems.append((i + 6, i + 12))
+    for i in range(5):  # Diagonal cross bars (X) for both stories
+        elems.append((i, i + 7))
+        elems.append((i + 1, i + 6))
+        elems.append((i + 6, i + 13))
+        elems.append((i + 7, i + 12))
+    return elems
+
+
+# =====================================================================
+# 4. DEGREE OF FREEDOM (DOF) MAPPING
+# =====================================================================
+def assign_dof(order):
+    """
+    Maps physical node IDs to mathematical Degrees of Freedom (DOFs).
+    'order' is the specific numbering scheme (e.g., standard, RCM, or manual).
+    Returns a dictionary mapping (physical_node_id, 'x' or 'y') to a 1-based DOF integer.
+    """
+    dof_map = {}
+    counter = 1
+    for n in order:
+        dof_map[(n, 'x')] = counter  # X-direction displacement DOF
+        counter += 1
+        dof_map[(n, 'y')] = counter  # Y-direction displacement DOF
+        counter += 1
+    return dof_map
+
+
+def get_bandwidth(K):
+    """
+    Calculates the semi-bandwidth (m) of the stiffness matrix.
+    Formula: Max distance of any non-zero element from the main diagonal + 1.
+    """
+    rows, cols = np.nonzero(K)
+    bw = np.max(np.abs(rows - cols))
+    return bw + 1
+
+
+# =====================================================================
+# 5. REVERSE CUTHILL-MCKEE (RCM) ALGORITHM - Q1(c) Requirement
+# =====================================================================
+def rcm_order(nodes, elements):
+    """
+    Heuristic algorithm to minimize the bandwidth of a symmetric matrix.
+    It builds an adjacency graph, finds the node with the minimum degree
+    (connections), and performs a Breadth-First Search (BFS), then reverses the result.
+    """
+    n = len(nodes)
+    adjacency = {i: set() for i in range(n)}
+    for i, j in elements:
+        adjacency[i].add(j)
+        adjacency[j].add(i)
+
+    visited = [False] * n
+    order = []
+    # Node degree = number of connected neighbors
+    degrees = {i: len(adjacency[i]) for i in adjacency}
+    start = min(degrees, key=degrees.get)  # Start at node with minimum connections
+    queue = [start]
+
+    while queue:
+        node = queue.pop(0)
+        if visited[node]: continue
+        visited[node] = True
+        order.append(node)
+
+        # Sort neighbors by their degree to keep the band narrow
+        neighbors = list(adjacency[node])
+        neighbors.sort(key=lambda x: len(adjacency[x]))
+        for nb in neighbors:
+            if not visited[nb]:
+                queue.append(nb)
+
+    order.reverse()  # Reverse the ordering (The 'R' in RCM)
+    return order
+
+
+# =====================================================================
+# 6. GLOBAL STIFFNESS MATRIX ASSEMBLY & BOUNDARY CONDITIONS
+# =====================================================================
+def assemble_stiffness(nodes, elements, dof_map):
+    """
+    Constructs the global stiffness matrix (K) by calculating 4x4 local
+    stiffness matrices for each truss member and adding them to the global K.
+    """
+    num_dof = len(nodes) * 2
+    K = np.zeros((num_dof, num_dof))
+
+    for (i, j) in elements:
+        x1, y1 = nodes[i]
+        x2, y2 = nodes[j]
+
+        # Member length (L) and direction cosines (c, s)
+        L = np.hypot(x2 - x1, y2 - y1)
+        c = (x2 - x1) / L
+        s = (y2 - y1) / L
+
+        # 4x4 Local Stiffness Matrix for 2D Truss element
+        coef = (E * AREA) / L
+        k_local = coef * np.array([
+            [c * c, c * s, -c * c, -c * s],
+            [c * s, s * s, -c * s, -s * s],
+            [-c * c, -c * s, c * c, c * s],
+            [-c * s, -s * s, c * s, s * s]
+        ])
+
+        # Identify global DOF indices (0-based for NumPy arrays)
+        dofs = [
+            dof_map[(i, 'x')] - 1, dof_map[(i, 'y')] - 1,
+            dof_map[(j, 'x')] - 1, dof_map[(j, 'y')] - 1
+        ]
+
+        # Assembly process: Add local stiffness to global stiffness matrix
+        for row in range(4):
+            for col in range(4):
+                K[dofs[row], dofs[col]] += k_local[row, col]
+
+    return K
+
+
+def apply_bcs_and_loads(K, nodes, dof_map):
+    """
+    Applies the 5kN external forces and enforces support constraints
+    (Pin and Roller) using the Zeroing (row/col) Method.
+    """
+    num_dof = len(nodes) * 2
+    F = np.zeros(num_dof)  # Global Force Vector
+
+    # LOADS: Apply -5000 N (downwards) at top nodes adjacent to mid-span (x=8 and x=12)
+    max_y = np.max(nodes[:, 1])
+    for i, (x, y) in enumerate(nodes):
+        if y == max_y and (x == 8.0 or x == 12.0):
+            idx_y = dof_map[(i, 'y')] - 1
+            F[idx_y] = -5000.0
+
+    # BOUNDARY CONDITIONS (SUPPORTS):
+    # Pin support at (0,0) -> Locks x and y displacements
+    # Roller support at (20,0) -> Locks y displacement only
+    bc_dofs = []
+    for i, (x, y) in enumerate(nodes):
+        if x == 0.0 and y == 0.0:
+            bc_dofs.append(dof_map[(i, 'x')] - 1)
+            bc_dofs.append(dof_map[(i, 'y')] - 1)
+        if x == 20.0 and y == 0.0:
+            bc_dofs.append(dof_map[(i, 'y')] - 1)
+
+    # Zeroing Method: Set constrained rows and columns to 0, diagonal to 1, force to 0.
+    for idx in bc_dofs:
+        K[idx, :] = 0.0
+        K[:, idx] = 0.0
+        K[idx, idx] = 1.0
+        F[idx] = 0.0
+
+    return K, F
+
+
+# =====================================================================
+# 7. BANDED SOLVER SUBROUTINES (LU FACTORIZATION & SUBSTITUTIONS)
+# =====================================================================
+def factorize_lu_banded(band_mat):
+    """
+    Performs In-Place LU Factorization restricted to the bandwidth (m).
+    Rule: Do not allocate additional memory. Store lower triangular factors in A.
+    Returns the operation count (FLOPs).
+    """
+    A = band_mat.A
+    n = band_mat.r
+    m = band_mat.m
+    ops = 0
+
+    # Outer loop over diagonal pivots
+    for k in range(n):
+        end_col = min(n, k + m)  # Restrict operations to the band limit
+        for i in range(k + 1, end_col):
+            if A[i, k] != 0.0:  # Skip structural zeros inside the band
+                # Calculate multiplier
+                factor = A[i, k] / A[k, k]
+                # IN-PLACE STORAGE: Overwrite A[i,k] with the L multiplier
+                A[i, k] = factor
+                ops += 1  # 1 Division
+
+                # Update remaining elements in the row
+                for j in range(k + 1, end_col):
+                    A[i, j] -= factor * A[k, j]
+                    ops += 2  # 1 Multiplication, 1 Subtraction
+    return ops
+
+
+def forward_sub_banded(band_mat, F):
+    """
+    Solves [L]{y} = {F} using Forward Substitution.
+    Returns intermediate vector {y} and operation count.
+    """
+    A = band_mat.A
+    n = band_mat.r
+    m = band_mat.m
+    y = np.zeros(n)
+    ops = 0
+
+    for i in range(n):
+        s = 0.0
+        start_j = max(0, i - m + 1)  # Restrict to band limit
+        for j in range(start_j, i):
+            s += A[i, j] * y[j]
+            ops += 2  # 1 Mult, 1 Add
+        y[i] = F[i] - s  # L diagonal is implicitly 1, no division needed
+        ops += 1  # 1 Sub
+    return y, ops
+
+
+def back_sub_banded(band_mat, y):
+    """
+    Solves [U]{d} = {y} using Backward Substitution.
+    Returns final displacement vector {d} and operation count.
+    """
+    A = band_mat.A
+    n = band_mat.r
+    m = band_mat.m
+    d = np.zeros(n)
+    ops = 0
+
+    # Start from the bottom row and move upwards
+    for i in range(n - 1, -1, -1):
+        s = 0.0
+        end_j = min(n, i + m)  # Restrict to band limit
+        for j in range(i + 1, end_j):
+            s += A[i, j] * d[j]
+            ops += 2  # 1 Mult, 1 Add
+        # Must divide by U's diagonal pivot
+        d[i] = (y[i] - s) / A[i, i]
+        ops += 2  # 1 Sub, 1 Div
+    return d, ops
+
+
+# =====================================================================
+# 8. PLOTTING AND VISUALIZATION FUNCTIONS
+# =====================================================================
+def plot_physical_model(nodes, elements, order, title):
+    """
+    Plots the truss geometry, supports, external loads, and labels each node
+    according to the active numbering scheme (order).
+    """
+    fig, ax = plt.subplots(figsize=(10, 4))
+
+    # Draw elements (bars)
+    for (i, j) in elements:
+        ax.plot([nodes[i][0], nodes[j][0]], [nodes[i][1], nodes[j][1]], 'k-', lw=1.5, zorder=1)
+
+    # Draw nodes
+    ax.plot(nodes[:, 0], nodes[:, 1], 'bo', ms=5, zorder=2)
+
+    # Draw supports
+    ax.plot(0, 0, 'g^', ms=12, label='Pin Support (Locked x,y)', zorder=3)
+    ax.plot(20, 0, 'go', ms=10, label='Roller Support (Locked y)', zorder=3)
+
+    # Draw loads (5 kN downward arrows)
+    max_y = np.max(nodes[:, 1])
+    for (x, y) in nodes:
+        if y == max_y and (x == 8.0 or x == 12.0):
+            ax.annotate('5 kN', xy=(x, y), xytext=(x, y + 2.5),
+                        arrowprops=dict(facecolor='red', shrink=0.05, width=2, headwidth=8),
+                        ha='center', color='red', fontweight='bold', fontsize=12)
+
+    # Label nodes with their dynamically assigned Node Number based on the current scheme
+    # Create a reverse map: physical_id -> new_node_id (1-based)
+    new_id_map = {physical_id: new_id + 1 for new_id, physical_id in enumerate(order)}
+    for physical_id, (x, y) in enumerate(nodes):
+        node_num = new_id_map[physical_id]
+        ax.text(x, y + 0.35, f"N{node_num}", color='darkblue', fontweight='bold', ha='center', fontsize=9,
+                bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=1))
+
+    ax.set_title(title, fontweight='bold', pad=15)
+    ax.set_aspect('equal')
+    ax.set_xlim(-2, 22)
+    ax.set_ylim(-2, max_y + 4)
+    ax.grid(True, linestyle='--', alpha=0.6)
+    ax.legend(loc='upper right')
+    plt.show()
+
+
+def plot_lower_triangular_x(K, bw, title):
+    """
+    Plots the non-zero coefficients of the lower triangular portion
+    of the factored stiffness matrix, confirming the in-place factorization.
+    """
+    L = np.tril(K, -1)  # Extract only the lower triangular part (excluding diagonal)
+    n = K.shape[0]
+    fig, ax = plt.subplots(figsize=(10, 10))
+
+    # Place 'X' strictly on non-zero elements
+    rows, cols = np.nonzero(L)
+    for r, c in zip(rows, cols):
+        ax.text(c + 1, r + 1, 'X', ha='center', va='center', color='black', fontsize=9, fontweight='bold')
+
+    # Formatting the plot limits and grid
+    ax.set_xlim(0.5, n + 0.5)
+    ax.set_ylim(n + 0.5, 0.5)  # Invert Y axis for matrix format
+    ax.set_xticks(range(1, n + 1))
+    ax.set_yticks(range(1, n + 1))
+    ax.tick_params(axis='both', labelsize=8)
+    ax.grid(True, color='gray', linestyle=':', alpha=0.5)
+
+    # Draw Main Diagonal and Bandwidth Limit Boundaries
+    x_diag = np.arange(1, n + 1)
+    ax.plot(x_diag, x_diag, 'r--', alpha=0.4, label='Main Diagonal')
+    ax.plot(x_diag, x_diag + (bw - 1), 'b-', alpha=0.6, linewidth=2, label='Bandwidth Limit')
+
+    ax.set_xlabel("Column Number")
+    ax.set_ylabel("Row Number")
+    ax.set_title(title, pad=15, fontweight='bold')
+    ax.legend(loc='upper right')
+    plt.show()
+
+
+# =====================================================================
+# 9. MAIN EXECUTION CONTROLLER AND REPORT PRINTER
+# =====================================================================
+def solve_and_report(nodes, elements, order, case_name):
+    print(f"\n{'=' * 85}")
+    print(f"ANALYSIS REPORT: {case_name}")
+    print(f"{'=' * 85}")
+
+    # Generate DOF map based on the active node ordering scheme
+    dof_map = assign_dof(order)
+
+    # Assemble matrices, evaluate bandwidth, and apply Boundary Conditions
+    K = assemble_stiffness(nodes, elements, dof_map)
+    bw = get_bandwidth(K)
+    n = len(nodes) * 2  # Total Degrees of Freedom (DOF)
+    K, F = apply_bcs_and_loads(K, nodes, dof_map)
+
+    # Execute Banded Solver and count FLOPs
+    band_mat = BandedMatrix(K, bw)
+    ops_factor = factorize_lu_banded(band_mat)
+    y, ops_fwd = forward_sub_banded(band_mat, F)
+    displacements, ops_bwd = back_sub_banded(band_mat, y)
+    total_ops = ops_factor + ops_fwd + ops_bwd
+
+    # Formulate Theoretical FLOP Calculations (for report printing)
+    m = bw
+    fwd_p1, fwd_p2 = (m - 1) ** 2, (n - m + 1) * (2 * m - 1)
+    fwd_math = f"(m-1)^2 + (n-m+1)*(2m-1) -> {fwd_p1} + {fwd_p2}"
+
+    bwd_p1, bwd_p2 = m * (m - 1), (n - m + 1) * (2 * m)
+    bwd_math = f"m(m-1) + (n-m+1)*(2m) -> {bwd_p1} + {bwd_p2}"
+
+    fact_max = (n - m + 1) * (m - 1) * (2 * m - 1) + sum(w * (2 * w + 1) for w in range(1, m - 1))
+    fact_math = f"(Theoretical Max: {fact_max} FLOPs. Optimized by skipping zeros.)"
+
+    # --- PART (a): NODAL DISPLACEMENTS (PRINTED BY CURRENT NODE NUMBERING) ---
+    print("\n(a) Nodal Displacements (meters) - Sorted by specified numbering scheme:")
+    for new_idx, physical_idx in enumerate(order):
+        node_num = new_idx + 1  # Node number in the current scheme (1 to N)
+        x, y = nodes[physical_idx]  # Actual physical coordinates of this node
+
+        # Determine DOFs based on sequential ordering
+        idx_x = new_idx * 2
+        idx_y = new_idx * 2 + 1
+
+        dx = displacements[idx_x]
+        dy = displacements[idx_y]
+
+        # Displaying coordinates helps verify that supports are functioning correctly
+        # no matter what node ID is assigned to them.
+        print(f"  Node {node_num:2d} (x={x:4.1f}, y={y:4.1f}) -> dx: {dx:12.4e}, dy: {dy:12.4e}")
+
+    # --- PART (c): OPERATION COUNT (FLOPs) ---
+    print(f"\n(c) Operation Count (FLOPs) - Parameters: [n={n} DOFs, Bandwidth m={m}]:")
+    print(f"  Matrix Factorization : {ops_factor:<5} FLOPs  | Calc: {fact_math}")
+    print(f"  Forward Substitution : {ops_fwd:<5} FLOPs  | Calc: {fwd_math}")
+    print(f"  Back Substitution    : {ops_bwd:<5} FLOPs  | Calc: {bwd_math}")
+    print(f"  TOTAL OPERATIONS     : {total_ops:<5} FLOPs\n")
+
+    # --- PART (b): LOWER TRIANGULAR PLOT ---
+    plot_title = f"{case_name}\nLower Triangular Matrix (L) - Bandwidth: {m}"
+    plot_lower_triangular_x(band_mat.A, bw, plot_title)
+
+
+# =====================================================================
+# 10. EXECUTION SCENARIOS (MAIN BLOCK)
+# =====================================================================
+if __name__ == "__main__":
+
+    # -----------------------------------------------------------------
+    # CASE 1 ANALYSIS
+    # -----------------------------------------------------------------
+    nodes1 = case1_nodes()
+    elems1 = case1_elements()
+
+    # Q2(b) Requirement 1: Q1(a) Standard Numbering
+    order1_a = list(range(len(nodes1)))
+    plot_physical_model(nodes1, elems1, order1_a, "CASE 1 - Physical Model & Node IDs (Q1-a Standard)")
+    solve_and_report(nodes1, elems1, order1_a, "CASE 1 - Q1(a) Standard Numbering")
+
+    # Q2(b) Requirement 2: Q1(c) RCM Optimized Numbering
+    order1_c = rcm_order(nodes1, elems1)
+    plot_physical_model(nodes1, elems1, order1_c, "CASE 1 - Physical Model & Node IDs (Q1-c RCM Optimized)")
+    solve_and_report(nodes1, elems1, order1_c, "CASE 1 - Q1(c) RCM Optimized Numbering")
+
+    # -----------------------------------------------------------------
+    # CASE 2 ANALYSIS
+    # -----------------------------------------------------------------
+    nodes2 = case2_nodes()
+    elems2 = case2_elements()
+
+    # Q2(b) Requirement 1: Q1(a) Standard Numbering
+    order2_a = list(range(len(nodes2)))
+    plot_physical_model(nodes2, elems2, order2_a, "CASE 2 - Physical Model & Node IDs (Q1-a Standard)")
+    solve_and_report(nodes2, elems2, order2_a, "CASE 2 - Q1(a) Standard Numbering")
+
+    # Q2(b) Requirement 2: Q1(c) RCM Optimized Numbering
+    order2_c = rcm_order(nodes2, elems2)
+    plot_physical_model(nodes2, elems2, order2_c, "CASE 2 - Physical Model & Node IDs (Q1-c RCM Optimized)")
+    solve_and_report(nodes2, elems2, order2_c, "CASE 2 - Q1(c) RCM Optimized Numbering")
+
+    # -----------------------------------------------------------------
+    # BONUS: CASE 2 MANUAL OPTIMIZATION (Vertical Scan)
+    # -----------------------------------------------------------------
+    order2_b = []
+    for i in range(6):
+        order2_b.append(i + 12)  # Top chord
+        order2_b.append(i + 6)  # Middle chord
+        order2_b.append(i)  # Bottom chord
+
+    plot_physical_model(nodes2, elems2, order2_b, "CASE 2 - Physical Model & Node IDs (Q1-b Bonus Manual Scan)")
+    solve_and_report(nodes2, elems2, order2_b, "CASE 2 - BONUS Q1(b) Manual Column Scan")
